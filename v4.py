@@ -3072,6 +3072,119 @@ def run_alerts(symbol, period_label, df, trigger_ai=False, mkt=None):
     except Exception:
         pass
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # I. MACD 背離偵測（底背離/頂背離）
+    # ══════════════════════════════════════════════════════════════════════════
+    try:
+        if len(close) >= 40:
+            _dif_i, _dea_i, _ = calc_macd(close)
+            _c40   = close.iloc[-40:]
+            _dif40 = _dif_i.iloc[-40:]
+
+            def _find_lows(series):
+                vals = list(series.values)
+                lows = []
+                for i in range(2, len(vals)-2):
+                    if vals[i] < vals[i-1] and vals[i] < vals[i-2] and \
+                       vals[i] < vals[i+1] and vals[i] < vals[i+2]:
+                        lows.append(i)
+                merged = []
+                for idx in lows:
+                    if not merged or idx - merged[-1] > 5:
+                        merged.append(idx)
+                    elif vals[idx] < vals[merged[-1]]:
+                        merged[-1] = idx
+                return merged[-2:] if len(merged) >= 2 else []
+
+            def _find_highs(series):
+                vals = list(series.values)
+                highs = []
+                for i in range(2, len(vals)-2):
+                    if vals[i] > vals[i-1] and vals[i] > vals[i-2] and \
+                       vals[i] > vals[i+1] and vals[i] > vals[i+2]:
+                        highs.append(i)
+                merged = []
+                for idx in highs:
+                    if not merged or idx - merged[-1] > 5:
+                        merged.append(idx)
+                    elif vals[idx] > vals[merged[-1]]:
+                        merged[-1] = idx
+                return merged[-2:] if len(merged) >= 2 else []
+
+            # ── I1. MACD 底背離 ──────────────────────────────────────────────
+            _pl = _find_lows(_c40)
+            if len(_pl) >= 2:
+                _p1 = float(_c40.iloc[_pl[-2]]); _p2 = float(_c40.iloc[_pl[-1]])
+                _d1 = float(_dif40.iloc[_pl[-2]]); _d2 = float(_dif40.iloc[_pl[-1]])
+                _since = 39 - _pl[-1]
+                _dif_rising = float(_dif_i.iloc[-1]) > float(_dif_i.iloc[-1-min(3,len(_dif_i)-1)])
+                if (_p2 < _p1*0.9995 and _d2 > _d1*1.01 and _dif_rising and _since <= 20):
+                    ck = f"{symbol}|{period_label}|MACD底背離|{df.index[-1].strftime('%Y%m%d%H') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:13]}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        add_alert(symbol, period_label,
+                                  f"📈 【MACD底背離】價格創新低({_p1:.2f}→{_p2:.2f})"
+                                  f" 但DIF未創新低({_d1:.3f}→{_d2:.3f})"
+                                  f"，空頭動能衰竭，可能即將反彈！", "bull")
+                        new_signals.append("MACD底背離")
+
+            # ── I2. MACD 頂背離 ──────────────────────────────────────────────
+            _ph = _find_highs(_c40)
+            if len(_ph) >= 2:
+                _p1 = float(_c40.iloc[_ph[-2]]); _p2 = float(_c40.iloc[_ph[-1]])
+                _d1 = float(_dif40.iloc[_ph[-2]]); _d2 = float(_dif40.iloc[_ph[-1]])
+                _since = 39 - _ph[-1]
+                _dif_falling = float(_dif_i.iloc[-1]) < float(_dif_i.iloc[-1-min(3,len(_dif_i)-1)])
+                if (_p2 > _p1*1.0005 and _d2 < _d1*0.99 and _dif_falling and _since <= 20):
+                    ck = f"{symbol}|{period_label}|MACD頂背離|{df.index[-1].strftime('%Y%m%d%H') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:13]}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        add_alert(symbol, period_label,
+                                  f"📉 【MACD頂背離】價格創新高({_p1:.2f}→{_p2:.2f})"
+                                  f" 但DIF未創新高({_d1:.3f}→{_d2:.3f})"
+                                  f"，多頭動能衰竭，注意回落風險！", "bear")
+                        new_signals.append("MACD頂背離")
+
+    except Exception:
+        pass
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # J. MACD Histogram 動能衰竭偵測
+    # ══════════════════════════════════════════════════════════════════════════
+    try:
+        if len(close) >= 15:
+            _dif_j, _dea_j, _hist_j = calc_macd(close)
+            _hn  = float(_hist_j.iloc[-1])
+            _hp  = float(_hist_j.iloc[-2])
+            _h3  = float(_hist_j.iloc[-4])
+            _s5  = (float(close.iloc[-1]) - float(close.iloc[-5])) / float(close.iloc[-5]) * 100
+            _dif_now = float(_dif_j.iloc[-1])
+
+            # ── J1. 多頭動能衰竭 ─────────────────────────────────────────────
+            if (_hn > 0 and _hp > 0 and abs(_hn) < abs(_hp) < abs(_h3)
+                    and _s5 < 0.1 and _dif_now > 0):
+                ck = f"{symbol}|{period_label}|多頭動能衰竭|{df.index[-1].strftime('%Y%m%d%H') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:13]}"
+                if ck not in st.session_state.sent_alerts:
+                    st.session_state.sent_alerts.add(ck)
+                    add_alert(symbol, period_label,
+                              f"⚠️ 【多頭動能衰竭】Histogram連縮({_h3:.3f}→{_hp:.3f}→{_hn:.3f})"
+                              f"，上漲動能減弱，注意高位風險！", "bear")
+                    new_signals.append("多頭動能衰竭")
+
+            # ── J2. 空頭動能衰竭 ─────────────────────────────────────────────
+            elif (_hn < 0 and _hp < 0 and abs(_hn) < abs(_hp) < abs(_h3)
+                    and _s5 > -0.1 and _dif_now < 0):
+                ck = f"{symbol}|{period_label}|空頭動能衰竭|{df.index[-1].strftime('%Y%m%d%H') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:13]}"
+                if ck not in st.session_state.sent_alerts:
+                    st.session_state.sent_alerts.add(ck)
+                    add_alert(symbol, period_label,
+                              f"💡 【空頭動能衰竭】Histogram絕對值連縮({_h3:.3f}→{_hp:.3f}→{_hn:.3f})"
+                              f"，下跌動能減弱，可能即將止跌反彈！", "bull")
+                    new_signals.append("空頭動能衰竭")
+
+    except Exception:
+        pass
+
     # ── 有新信號且啟用 AI → 自動觸發 Groq 分析 ─────────────────────────────
     if not new_signals or not trigger_ai:
         return
