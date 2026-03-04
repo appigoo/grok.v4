@@ -371,22 +371,23 @@ def fetch_vix_history() -> pd.Series:
     except Exception:
         return pd.Series(dtype=float)
 
-@st.cache_data(ttl=90)
+@st.cache_data(ttl=60)   # 縮短至 60 秒，確保數據更新更即時
 def fetch_vix_intraday() -> dict:
     """
-    抓取 VIX 盤中即時數據（5分鐘K線），
+    抓取 VIX 盤中即時數據（1分鐘K線），
     計算：當日漲跌幅、近期方向動量、與前日收盤比較。
     """
     result = {
         "spot": None, "open_today": None,
         "chg_from_open": 0, "chg_pct_from_open": 0,
         "chg_from_prev": 0, "chg_pct_from_prev": 0,
-        "trend_5bar": "flat",   # up/down/flat（近5根方向）
-        "trend_label": "",
-        "signal": 0,            # -4 到 +4（股市影響方向，VIX漲=負值）
+        "trend_5bar": "flat",
+        "trend_label": "→平穩",
+        "last_bar_time": "",    # 最新一根K線的時間（用於診斷）
+        "signal": 0,
         "signal_label": "",
         "signal_color": "#888888",
-        "bars": None,           # 近期 K 線 DataFrame
+        "bars": None,
         "error": None,
     }
     try:
@@ -403,10 +404,11 @@ def fetch_vix_intraday() -> dict:
         # 轉換到 ET 時區
         try:
             import pytz as _ptz
+            _et = _ptz.timezone("America/New_York")
             if df.index.tzinfo is None:
-                df = df.tz_localize("UTC").tz_convert(_ptz.timezone("America/New_York"))
+                df = df.tz_localize("UTC").tz_convert(_et)
             else:
-                df = df.tz_convert(_ptz.timezone("America/New_York"))
+                df = df.tz_convert(_et)
         except Exception:
             pass
 
@@ -414,21 +416,57 @@ def fetch_vix_intraday() -> dict:
         result["spot"] = spot
         result["bars"] = df
 
-        # 前一交易日收盤（取最後一個非今日的收盤）
-        today = df.index[-1].date()
-        prev_bars = df[df.index.map(lambda t: t.date()) < today]
-        if not prev_bars.empty:
-            prev_close = float(prev_bars["Close"].iloc[-1])
-            result["chg_from_prev"]     = spot - prev_close
-            result["chg_pct_from_prev"] = (spot - prev_close) / prev_close * 100
+        # 記錄最新一根時間（供 UI 診斷顯示）
+        try:
+            result["last_bar_time"] = df.index[-1].strftime("%m/%d %H:%M ET")
+        except Exception:
+            result["last_bar_time"] = ""
 
-        # 今日開盤（今日第一根K線）
-        today_bars = df[df.index.map(lambda t: t.date()) == today]
-        if not today_bars.empty:
-            open_today = float(today_bars["Open"].iloc[0])
-            result["open_today"]         = open_today
-            result["chg_from_open"]      = spot - open_today
-            result["chg_pct_from_open"]  = (spot - open_today) / open_today * 100
+        # 前一交易日收盤：取最後一根「正規盤收盤時段（15:55-16:00）」的數據
+        # 不依賴 date() 比較，改用小時判斷，避免盤後/盤前 date 相同問題
+        try:
+            # 找正規盤的所有K線（09:30-16:00 ET）
+            reg_mask = (
+                (df.index.hour > 9 | ((df.index.hour == 9) & (df.index.minute >= 30))) &
+                (df.index.hour < 16)
+            )
+            reg_bars = df[reg_mask]
+            if len(reg_bars) >= 2:
+                # 最後一個正規盤 session 結束的收盤（前一日）
+                last_reg_date = reg_bars.index[-1].date()
+                prev_reg_bars = reg_bars[reg_bars.index.map(lambda t: t.date()) < last_reg_date]
+                if not prev_reg_bars.empty:
+                    prev_close = float(prev_reg_bars["Close"].iloc[-1])
+                else:
+                    # 當天是第一個正規盤 session，用開盤前第一根作為參考
+                    prev_close = float(reg_bars["Close"].iloc[0])
+                # 當日收盤（最後一根正規盤）
+                today_reg_close = float(reg_bars["Close"].iloc[-1])
+                result["chg_from_prev"]     = today_reg_close - prev_close
+                result["chg_pct_from_prev"] = (today_reg_close - prev_close) / prev_close * 100
+                # spot 可能是盤後價，用 spot 對比前日正規盤收盤
+                result["chg_from_prev"]     = spot - prev_close
+                result["chg_pct_from_prev"] = (spot - prev_close) / prev_close * 100
+        except Exception:
+            # fallback：用 date 比較
+            today = df.index[-1].date()
+            prev_bars_fb = df[df.index.map(lambda t: t.date()) < today]
+            if not prev_bars_fb.empty:
+                prev_close = float(prev_bars_fb["Close"].iloc[-1])
+                result["chg_from_prev"]     = spot - prev_close
+                result["chg_pct_from_prev"] = (spot - prev_close) / prev_close * 100
+
+        # 今日開盤（今日第一根正規盤K線）
+        try:
+            today_date = df.index[-1].date()
+            today_bars = df[df.index.map(lambda t: t.date()) == today_date]
+            if not today_bars.empty:
+                open_today = float(today_bars["Open"].iloc[0])
+                result["open_today"]        = open_today
+                result["chg_from_open"]     = spot - open_today
+                result["chg_pct_from_open"] = (spot - open_today) / open_today * 100
+        except Exception:
+            pass
 
         # 近15根1分鐘K線方向動量（= 約15分鐘趨勢）
         if len(df) >= 15:
@@ -440,6 +478,8 @@ def fetch_vix_intraday() -> dict:
                 result["trend_5bar"] = "down"
             else:
                 result["trend_5bar"] = "flat"
+
+        result["trend_label"] = {"up": "↑上升中", "down": "↓下降中", "flat": "→平穩"}[result["trend_5bar"]]
 
         # 綜合訊號：VIX漲→股市空，VIX跌→股市多
         pct = result["chg_pct_from_prev"]
@@ -460,7 +500,6 @@ def fetch_vix_intraday() -> dict:
         result["signal"]       = sig
         result["signal_label"] = lbl
         result["signal_color"] = col
-        result["trend_label"]  = {"up":"↑上升中","down":"↓下降中","flat":"→平穩"}[result["trend_5bar"]]
 
     except Exception as e:
         result["error"] = str(e)
@@ -3675,11 +3714,12 @@ def _render_mtf_confluence(symbol: str, mtf_data: dict):
     try:
         vix_intra    = fetch_vix_intraday()
         vix_spot     = vix_intra.get("spot") or 20
-        vix_signal   = vix_intra.get("signal", 0)           # -4~+4，VIX下跌=正值
+        vix_signal   = vix_intra.get("signal", 0)
         vix_sig_lbl  = vix_intra.get("signal_label", "")
         vix_sig_col  = vix_intra.get("signal_color", "#888888")
-        vix_trend_lb = vix_intra.get("trend_label", "")
+        vix_trend_lb = vix_intra.get("trend_label", "→平穩")
         vix_pct      = vix_intra.get("chg_pct_from_prev", 0)
+        vix_bar_time = vix_intra.get("last_bar_time", "")
 
         # 同時保留期限結構數據
         vix_term     = fetch_vix_term_structure()
@@ -3877,6 +3917,7 @@ def _render_mtf_confluence(symbol: str, mtf_data: dict):
         f'      {vix_spot:.2f}　{vix_trend_lb}　{vix_pct:+.1f}%</span>'
         f'    <span style="color:{vix_momentum_color};font-size:0.78rem;flex:1;">'
         f'      　{vix_momentum_label}</span>'
+        f'    <span style="color:#334455;font-size:0.68rem;">更新:{vix_bar_time}</span>'
         f'  </div>'
         # VIX 期限結構環境列
         f'  <div style="background:#0a1525;border:1px solid {vix_color}44;border-radius:6px;'
