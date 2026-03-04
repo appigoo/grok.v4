@@ -426,9 +426,11 @@ def fetch_vix_intraday() -> dict:
         # 不依賴 date() 比較，改用小時判斷，避免盤後/盤前 date 相同問題
         try:
             # 找正規盤的所有K線（09:30-16:00 ET）
+            _h = df.index.hour
+            _m = df.index.minute
             reg_mask = (
-                (df.index.hour > 9 | ((df.index.hour == 9) & (df.index.minute >= 30))) &
-                (df.index.hour < 16)
+                ((_h > 9) | ((_h == 9) & (_m >= 30))) &
+                (_h < 16)
             )
             reg_bars = df[reg_mask]
             if len(reg_bars) >= 2:
