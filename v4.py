@@ -615,6 +615,104 @@ def fetch_vix_intraday() -> dict:
     })
     return result
 
+@st.cache_data(ttl=120)
+def fetch_vix_term_structure() -> dict:
+    """
+    抓取 VIX 期限結構數據：
+    - VIX 現貨 (^VIX)
+    - VIX9D 超短期 (^VIX9D) — 9日隱含波動率
+    - VIX3M 中期 (^VIX3M) — 3個月
+    - VIX6M 長期 (^VIX6M) — 6個月
+    期限結構類型：Contango（正向，正常）/ Backwardation（反向，恐慌）
+    """
+    result = {
+        "spot": None, "vix9d": None, "vix3m": None, "vix6m": None,
+        "structure": "unknown", "contango_pct": None,
+        "panic_type": "normal", "alert_msg": None,
+        "spy_1d_chg_pct": None, "vix_1d_chg_pct": 0,
+        "source": "none",
+    }
+
+    def _fetch_last(ticker):
+        try:
+            df = yf.download(ticker, period="5d", interval="1d",
+                             auto_adjust=True, progress=False)
+            if df.empty:
+                return None
+            df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+            return float(df["Close"].dropna().iloc[-1])
+        except Exception:
+            return None
+
+    spot  = _fetch_last("^VIX")
+    vix9d = _fetch_last("^VIX9D")
+    vix3m = _fetch_last("^VIX3M")
+    vix6m = _fetch_last("^VIX6M")
+    spy   = _fetch_last("SPY")
+
+    result["spot"]  = spot
+    result["vix9d"] = vix9d
+    result["vix3m"] = vix3m
+    result["vix6m"] = vix6m
+
+    # VIX 當日漲跌幅（日K）
+    try:
+        vix_series = fetch_vix_history()
+        if len(vix_series) >= 2:
+            vix_1d_chg_pct = float((vix_series.iloc[-1] - vix_series.iloc[-2])
+                                   / vix_series.iloc[-2] * 100)
+        else:
+            vix_1d_chg_pct = 0
+    except Exception:
+        vix_1d_chg_pct = 0
+    result["vix_1d_chg_pct"] = vix_1d_chg_pct
+
+    # SPY 當日漲跌幅
+    try:
+        spy_df = yf.download("SPY", period="5d", interval="1d",
+                             auto_adjust=True, progress=False)
+        spy_df.columns = [c[0] if isinstance(c, tuple) else c for c in spy_df.columns]
+        spy_s = spy_df["Close"].dropna()
+        spy_1d_chg_pct = float((spy_s.iloc[-1] - spy_s.iloc[-2]) / spy_s.iloc[-2] * 100) if len(spy_s) >= 2 else 0
+    except Exception:
+        spy_1d_chg_pct = 0
+    result["spy_1d_chg_pct"] = spy_1d_chg_pct
+
+    vix_spike  = vix_1d_chg_pct > 15
+
+    # 期限結構判斷（用 VIX vs VIX3M）
+    if spot and vix3m:
+        if spot > vix3m * 1.05:
+            result["structure"]    = "Backwardation"
+            result["contango_pct"] = (spot - vix3m) / vix3m * 100
+            result["panic_type"]   = "systemic"
+            if vix_spike and spy_1d_chg_pct < -2:
+                result["alert_msg"] = (
+                    f"🚨 VIX 暴升 +{vix_1d_chg_pct:.1f}% 且 SPY 重跌 {spy_1d_chg_pct:+.1f}%"
+                    f"，期限結構反轉（Backwardation），系統性風險警報！"
+                )
+            elif vix_spike:
+                result["alert_msg"] = (
+                    f"🟡 短期恐慌底訊號｜VIX 暴升+{vix_1d_chg_pct:.0f}% 但結構 Contango，非系統風險"
+                )
+        elif spot < vix3m * 0.95:
+            result["structure"]    = "Contango"
+            result["contango_pct"] = (vix3m - spot) / spot * 100
+            result["panic_type"]   = "short_term_fear" if vix_spike else "normal"
+            if vix_spike:
+                result["alert_msg"] = (
+                    f"📊 VIX 暴升 +{vix_1d_chg_pct:.1f}% 但 SPY 跌幅有限 ({spy_1d_chg_pct:+.1f}%)"
+                    f"，Contango 結構完整，可能是短期恐慌底"
+                )
+        else:
+            result["structure"]    = "Flat"
+            result["contango_pct"] = 0
+            result["panic_type"]   = "normal"
+
+    result["source"] = "yfinance"
+    return result
+
+
 def get_vix_regime(vix: float) -> tuple:
     """回傳 (狀態描述, 顏色, 條寬%) """
     if vix < 13:   return ("超低波動 😴",  "#00ee66", 10)
