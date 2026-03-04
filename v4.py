@@ -390,7 +390,7 @@ def fetch_vix_intraday() -> dict:
         "error": None,
     }
     try:
-        res = _yahoo_chart_api("^VIX", "5m", "5d")
+        res = _yahoo_chart_api("^VIX", "1m", "5d")
         if res["error"] or res["df"] is None:
             result["error"] = res.get("error", "VIX 數據失敗")
             return result
@@ -430,13 +430,13 @@ def fetch_vix_intraday() -> dict:
             result["chg_from_open"]      = spot - open_today
             result["chg_pct_from_open"]  = (spot - open_today) / open_today * 100
 
-        # 近5根K線方向動量
-        if len(df) >= 5:
-            last5 = df["Close"].iloc[-5:]
-            slope = (float(last5.iloc[-1]) - float(last5.iloc[0])) / float(last5.iloc[0]) * 100
-            if slope > 1.5:
+        # 近15根1分鐘K線方向動量（= 約15分鐘趨勢）
+        if len(df) >= 15:
+            last_n = df["Close"].iloc[-15:]
+            slope = (float(last_n.iloc[-1]) - float(last_n.iloc[0])) / float(last_n.iloc[0]) * 100
+            if slope > 0.8:
                 result["trend_5bar"] = "up"
-            elif slope < -1.5:
+            elif slope < -0.8:
                 result["trend_5bar"] = "down"
             else:
                 result["trend_5bar"] = "flat"
@@ -466,154 +466,7 @@ def fetch_vix_intraday() -> dict:
         result["error"] = str(e)
 
     return result
-    """
-    抓取 VIX 期限結構數據：
-    - VIX 現貨 (^VIX)
-    - VIX9D 超短期 (^VIX9D) — 9日隱含波動率
-    - VIX3M 中期 (^VIX3M) — 3個月
-    - VIX6M 長期 (^VIX6M) — 6個月
-    - SPY 期貨替代：用 SPY 當日漲跌幅近似期貨壓力
 
-    回傳 dict with:
-      spot, vix9d, vix3m, vix6m,
-      structure: 'contango' | 'backwardation' | 'flat'
-      panic_type: 'short_term' | 'systemic' | 'normal'
-      interpretation: str (中文解讀)
-      score: float (0=極度恐慌, 100=極度平靜)
-    """
-    result = {
-        "spot": None, "vix9d": None, "vix3m": None, "vix6m": None,
-        "structure": "unknown", "panic_type": "normal",
-        "interpretation": "", "alert": None, "alert_type": "info",
-        "contango_pct": None,
-    }
-
-    def _fetch_last(ticker):
-        try:
-            df = yf.download(ticker, period="3d", interval="1d",
-                             auto_adjust=True, progress=False)
-            df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-            s = df["Close"].dropna()
-            return float(s.iloc[-1]) if not s.empty else None
-        except Exception:
-            return None
-
-    spot  = _fetch_last("^VIX")
-    vix9d = _fetch_last("^VIX9D")
-    vix3m = _fetch_last("^VIX3M")
-    vix6m = _fetch_last("^VIX6M")
-
-    result.update({"spot": spot, "vix9d": vix9d, "vix3m": vix3m, "vix6m": vix6m})
-
-    if spot is None or vix3m is None:
-        result["interpretation"] = "期限結構數據不足"
-        return result
-
-    # ── 計算期限結構 ──────────────────────────────────────────────────────
-    # Contango = 正常：遠月 > 近月（市場平靜，未來不確定性溢價）
-    # Backwardation = 警告：近月 > 遠月（當下恐慌 > 未來預期）
-    contango_pct = (vix3m - spot) / spot * 100   # 正 = contango, 負 = backwardation
-
-    if contango_pct > 5:
-        structure = "contango"
-    elif contango_pct < -3:
-        structure = "backwardation"
-    else:
-        structure = "flat"
-
-    result["structure"]    = structure
-    result["contango_pct"] = contango_pct
-
-    # ── VIX 當日變化 ─────────────────────────────────────────────────────
-    try:
-        vix_df = yf.download("^VIX", period="5d", interval="1d",
-                             auto_adjust=True, progress=False)
-        vix_df.columns = [c[0] if isinstance(c, tuple) else c for c in vix_df.columns]
-        vix_series = vix_df["Close"].dropna()
-        vix_1d_chg_pct = float((vix_series.iloc[-1] - vix_series.iloc[-2])
-                               / vix_series.iloc[-2] * 100) if len(vix_series) >= 2 else 0
-    except Exception:
-        vix_1d_chg_pct = 0
-
-    # ── SPY 日漲跌幅（近似期貨壓力）─────────────────────────────────────
-    try:
-        spy_df = yf.download("SPY", period="5d", interval="1d",
-                             auto_adjust=True, progress=False)
-        spy_df.columns = [c[0] if isinstance(c, tuple) else c for c in spy_df.columns]
-        spy_s = spy_df["Close"].dropna()
-        spy_1d_chg_pct = float((spy_s.iloc[-1] - spy_s.iloc[-2])
-                               / spy_s.iloc[-2] * 100) if len(spy_s) >= 2 else 0
-    except Exception:
-        spy_1d_chg_pct = 0
-
-    # ── 核心理論判斷 ─────────────────────────────────────────────────────
-    vix_spike  = vix_1d_chg_pct > 15    # VIX 單日暴升 >15%
-    spy_drop   = spy_1d_chg_pct < -1.5  # SPY 下跌 >1.5%（期貨壓力）
-    vix_high   = spot > 25
-
-    if vix_spike and not spy_drop and structure in ("contango", "flat"):
-        # 情境一：VIX 暴升但期貨壓力小 + 仍是 Contango → 短期恐慌底
-        panic_type = "short_term"
-        interpretation = (
-            f"📊 VIX 暴升 +{vix_1d_chg_pct:.1f}% 但 SPY 跌幅有限 ({spy_1d_chg_pct:+.1f}%)"
-            f"，期限結構仍為 Contango（遠月溢價 {contango_pct:+.1f}%）。"
-            f"市場認為「短期嚇一嚇」，非系統性風險。"
-            f"👉 有機會是短期恐慌底，可留意反彈買入機會。"
-        )
-        alert_msg  = f"🟡 短期恐慌底訊號｜VIX 暴升+{vix_1d_chg_pct:.0f}% 但結構 Contango，非系統風險"
-        alert_type = "info"
-
-    elif vix_spike and spy_drop and structure == "backwardation":
-        # 情境二：VIX + 期貨一起大升 + Backwardation → 真風險
-        panic_type = "systemic"
-        interpretation = (
-            f"🚨 VIX 暴升 +{vix_1d_chg_pct:.1f}% 且 SPY 重跌 {spy_1d_chg_pct:+.1f}%"
-            f"，期限結構出現 Backwardation（近月溢價 {abs(contango_pct):.1f}%）。"
-            f"近月恐慌 > 遠月預期，市場對當前風險定價極高。"
-            f"👉 真風險訊號，可能進入中期調整，建議降低倉位。"
-        )
-        alert_msg  = f"🔴 系統性風險｜VIX Backwardation 出現！近月溢價 {abs(contango_pct):.1f}%，中期調整風險高"
-        alert_type = "bear"
-
-    elif vix_high and structure == "backwardation":
-        # VIX 高位 + Backwardation（即使今天沒有暴升）
-        panic_type = "systemic"
-        interpretation = (
-            f"⚠️ VIX 持續高位 {spot:.1f} 且期限結構 Backwardation（近月溢價 {abs(contango_pct):.1f}%）。"
-            f"市場仍在為當前風險大幅溢價，恐慌尚未消退。"
-            f"👉 中期調整訊號持續，謹慎操作。"
-        )
-        alert_msg  = f"🔴 持續風險｜VIX {spot:.1f} + Backwardation，中期調整未結束"
-        alert_type = "bear"
-
-    elif structure == "contango" and spot < 20:
-        # 完全正常
-        panic_type = "normal"
-        interpretation = (
-            f"✅ VIX {spot:.1f}，期限結構正常 Contango（遠月溢價 +{contango_pct:.1f}%）。"
-            f"市場平靜，無系統性風險訊號。"
-        )
-        alert_msg  = None
-        alert_type = "info"
-
-    else:
-        panic_type = "watch"
-        interpretation = (
-            f"🟡 VIX {spot:.1f}，期限結構 {structure}（近遠月差 {contango_pct:+.1f}%）。"
-            f"保持關注，尚未觸發明確風險訊號。"
-        )
-        alert_msg  = None
-        alert_type = "info"
-
-    result.update({
-        "panic_type":     panic_type,
-        "interpretation": interpretation,
-        "alert":          alert_msg,
-        "alert_type":     alert_type,
-        "vix_1d_chg_pct": vix_1d_chg_pct,
-        "spy_1d_chg_pct": spy_1d_chg_pct,
-    })
-    return result
 
 @st.cache_data(ttl=120)
 def fetch_vix_term_structure() -> dict:
