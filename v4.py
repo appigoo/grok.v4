@@ -2940,6 +2940,138 @@ def run_alerts(symbol, period_label, df, trigger_ai=False, mkt=None):
                               f"，等待突破方向確認後入場！", "bull")
                     new_signals.append(f"V型反轉聚合+MACD金叉")
 
+        # ── G5. 均線回測再突破（第二次聚合後突破，更可靠）──────────────────
+        # 圖中形態：第一次聚合突破後，均線回縮再次纏繞，然後再度向上發散
+        if len(close) >= 30:
+            try:
+                # 用 EMA5/10/20/30 計算壓縮度（比 EMA60 對短周期更靈敏）
+                _e5h  = calc_ema(close, 5).iloc[-30:]
+                _e10h = calc_ema(close, 10).iloc[-30:]
+                _e20h = calc_ema(close, 20).iloc[-30:]
+                _e30h = calc_ema(close, 30).iloc[-30:]
+                _mean = (_e5h + _e10h + _e20h + _e30h) / 4
+                _compress_g5 = (
+                    (_e5h - _e30h).abs()
+                ) / _mean * 100   # EMA5 vs EMA30 極差 / 均值
+
+                # 閾值依時間週期調整（1分鐘更靈敏，用 0.15%）
+                _tight_thresh = 0.20
+                _tight_mask_g5 = _compress_g5 < _tight_thresh
+                _tight_idx_g5  = [i for i, v in enumerate(_tight_mask_g5) if v]
+
+                if len(_tight_idx_g5) >= 3:
+                    _last_tight  = _tight_idx_g5[-1]
+                    _first_tight = _tight_idx_g5[0]
+                    _tight_dur   = _last_tight - _first_tight
+                    _bars_since  = 29 - _last_tight
+
+                    e5_cur  = float(_e5h.iloc[-1])
+                    e20_cur = float(_e20h.iloc[-1])
+                    e30_cur = float(_e30h.iloc[-1])
+                    comp_cur = float(_compress_g5.iloc[-1])
+
+                    # 多頭回測再突破：壓縮後突破，EMA5 > EMA20 > EMA30
+                    if (_tight_dur >= 3 and _bars_since >= 2
+                            and comp_cur > _tight_thresh * 1.2
+                            and e5_cur > e20_cur > e30_cur
+                            and e5_cur > float(_e5h.iloc[-4])):
+                        ck = f"{symbol}|{period_label}|均線回測再突破|{df.index[-1].strftime('%Y%m%d%H') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:13]}"
+                        if ck not in st.session_state.sent_alerts:
+                            st.session_state.sent_alerts.add(ck)
+                            add_alert(symbol, period_label,
+                                      f"🎯 【回測再突破】均線纏繞({_tight_dur}根 <{_tight_thresh}%)"
+                                      f"→突破後回測→二次向上發散"
+                                      f"（EMA5:{e5_cur:.2f}>EMA20:{e20_cur:.2f}>EMA30:{e30_cur:.2f}）"
+                                      f"，二次突破成功率更高！", "bull")
+                            new_signals.append("均線回測再突破")
+
+                    # 空頭回測再下破
+                    elif (_tight_dur >= 3 and _bars_since >= 2
+                            and comp_cur > _tight_thresh * 1.2
+                            and e5_cur < e20_cur < e30_cur
+                            and e5_cur < float(_e5h.iloc[-4])):
+                        ck = f"{symbol}|{period_label}|均線回測再下破|{df.index[-1].strftime('%Y%m%d%H') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:13]}"
+                        if ck not in st.session_state.sent_alerts:
+                            st.session_state.sent_alerts.add(ck)
+                            add_alert(symbol, period_label,
+                                      f"⚠️ 【回測再下破】均線纏繞({_tight_dur}根)"
+                                      f"→下破後回測→二次向下發散"
+                                      f"（EMA5:{e5_cur:.2f}<EMA20:{e20_cur:.2f}<EMA30:{e30_cur:.2f}）"
+                                      f"，空頭加速！", "bear")
+                            new_signals.append("均線回測再下破")
+            except Exception:
+                pass
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # H. 量能爆發 + 均線多頭排列（圖中 21:00 場景）
+    #    量能從低迷突然暴增，同時 EMA 已完成多頭/空頭排列 → 趨勢加速訊號
+    # ══════════════════════════════════════════════════════════════════════════
+    try:
+        _e5   = float(calc_ema(close, 5).iloc[-1])
+        _e10  = float(calc_ema(close, 10).iloc[-1])
+        _e20  = float(calc_ema(close, 20).iloc[-1])
+        _e30  = float(calc_ema(close, 30).iloc[-1])
+        _e60  = float(calc_ema(close, 60).iloc[-1])
+        _price = float(close.iloc[-1])
+
+        # 均線多頭排列：EMA5 > EMA10 > EMA20 > EMA30，且全部朝上
+        _bull_align = (_e5 > _e10 > _e20 > _e30)
+        _bear_align = (_e5 < _e10 < _e20 < _e30)
+
+        # 量能計算：當前量 vs 近20根均量
+        _vol_now  = float(vol.iloc[-1])
+        _vol_ma20 = float(vol.rolling(20).mean().iloc[-1]) if len(vol) >= 20 else _vol_now
+        _vol_x    = _vol_now / _vol_ma20 if _vol_ma20 > 0 else 1
+
+        # 量能從低迷到爆發：近5根均量 vs 近20根均量，判斷是否突然放量
+        _vol_ma5_now  = float(vol.iloc[-5:].mean()) if len(vol) >= 5 else _vol_now
+        _vol_quiet    = _vol_ma5_now < _vol_ma20 * 0.7   # 近期量能低迷
+        _vol_prev_low = float(vol.iloc[-6:-1].mean()) if len(vol) >= 6 else _vol_ma20
+        _vol_surge_x  = _vol_now / _vol_prev_low if _vol_prev_low > 0 else 1
+
+        # ── H1. 量能暴增 + 多頭排列（趨勢加速上漲）────────────────────────
+        if _bull_align and _vol_x >= 3.0 and _price > _e5:
+            ck = f"{symbol}|{period_label}|量能爆發多頭|{df.index[-1].strftime('%Y%m%d%H%M') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:16]}"
+            if ck not in st.session_state.sent_alerts:
+                st.session_state.sent_alerts.add(ck)
+                _surge_desc = f"量×{_vol_x:.1f}（前均量{_vol_ma20/10000:.0f}萬→當前{_vol_now/10000:.0f}萬）"
+                if _vol_x >= 8.0:
+                    _h1_prefix = "🚀🔥 【極端爆量·多頭加速】"
+                    _h1_suffix = f"量能達均量×{_vol_x:.0f}，屬機構性掃單！"
+                elif _vol_x >= 5.0:
+                    _h1_prefix = "🔥🔥 【超級爆量·多頭加速】"
+                    _h1_suffix = f"量能達均量×{_vol_x:.0f}，強力追漲。"
+                else:
+                    _h1_prefix = "🔥 【量能爆發·多頭加速】"
+                    _h1_suffix = "趨勢加速上漲！"
+                add_alert(symbol, period_label,
+                          f"{_h1_prefix}EMA5>{_e5:.2f}>EMA10>EMA20>EMA30 完整多頭排列"
+                          f"，{_surge_desc}，{_h1_suffix}", "bull")
+                new_signals.append(f"量爆×{_vol_x:.1f}多頭排列")
+
+        # ── H2. 低迷量後突然爆量 + 均線突破（圖中 18:50 底部反彈場景）───
+        elif _vol_surge_x >= 4.0 and _price > _e20 and _e5 > _e20:
+            ck = f"{symbol}|{period_label}|低迷後爆量突破|{df.index[-1].strftime('%Y%m%d%H%M') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:16]}"
+            if ck not in st.session_state.sent_alerts:
+                st.session_state.sent_alerts.add(ck)
+                add_alert(symbol, period_label,
+                          f"⚡ 【低迷後爆量突破】量能靜止後突然暴增×{_vol_surge_x:.1f}"
+                          f"，價格突破EMA20（{_e20:.2f}），EMA5>{_e5:.2f}>EMA20，注意追漲！", "bull")
+                new_signals.append(f"低迷後爆量×{_vol_surge_x:.1f}")
+
+        # ── H3. 量能爆發 + 空頭排列（趨勢加速下跌）────────────────────────
+        elif _bear_align and _vol_x >= 3.0 and _price < _e5:
+            ck = f"{symbol}|{period_label}|量能爆發空頭|{df.index[-1].strftime('%Y%m%d%H%M') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:16]}"
+            if ck not in st.session_state.sent_alerts:
+                st.session_state.sent_alerts.add(ck)
+                add_alert(symbol, period_label,
+                          f"💀 【量能爆發·空頭加速】EMA5<EMA10<EMA20<EMA30 完整空頭排列"
+                          f"，量×{_vol_x:.1f}，趨勢加速下跌，避免接刀！", "bear")
+                new_signals.append(f"量爆×{_vol_x:.1f}空頭排列")
+
+    except Exception:
+        pass
+
     # ── 有新信號且啟用 AI → 自動觸發 Groq 分析 ─────────────────────────────
     if not new_signals or not trigger_ai:
         return
