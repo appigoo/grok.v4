@@ -371,8 +371,101 @@ def fetch_vix_history() -> pd.Series:
     except Exception:
         return pd.Series(dtype=float)
 
-@st.cache_data(ttl=120)
-def fetch_vix_term_structure() -> dict:
+@st.cache_data(ttl=90)
+def fetch_vix_intraday() -> dict:
+    """
+    抓取 VIX 盤中即時數據（5分鐘K線），
+    計算：當日漲跌幅、近期方向動量、與前日收盤比較。
+    """
+    result = {
+        "spot": None, "open_today": None,
+        "chg_from_open": 0, "chg_pct_from_open": 0,
+        "chg_from_prev": 0, "chg_pct_from_prev": 0,
+        "trend_5bar": "flat",   # up/down/flat（近5根方向）
+        "trend_label": "",
+        "signal": 0,            # -4 到 +4（股市影響方向，VIX漲=負值）
+        "signal_label": "",
+        "signal_color": "#888888",
+        "bars": None,           # 近期 K 線 DataFrame
+        "error": None,
+    }
+    try:
+        res = _yahoo_chart_api("^VIX", "5m", "5d")
+        if res["error"] or res["df"] is None:
+            result["error"] = res.get("error", "VIX 數據失敗")
+            return result
+
+        df = res["df"].dropna()
+        if df.empty:
+            result["error"] = "VIX 無數據"
+            return result
+
+        # 轉換到 ET 時區
+        try:
+            import pytz as _ptz
+            if df.index.tzinfo is None:
+                df = df.tz_localize("UTC").tz_convert(_ptz.timezone("America/New_York"))
+            else:
+                df = df.tz_convert(_ptz.timezone("America/New_York"))
+        except Exception:
+            pass
+
+        spot = float(df["Close"].iloc[-1])
+        result["spot"] = spot
+        result["bars"] = df
+
+        # 前一交易日收盤（取最後一個非今日的收盤）
+        today = df.index[-1].date()
+        prev_bars = df[df.index.map(lambda t: t.date()) < today]
+        if not prev_bars.empty:
+            prev_close = float(prev_bars["Close"].iloc[-1])
+            result["chg_from_prev"]     = spot - prev_close
+            result["chg_pct_from_prev"] = (spot - prev_close) / prev_close * 100
+
+        # 今日開盤（今日第一根K線）
+        today_bars = df[df.index.map(lambda t: t.date()) == today]
+        if not today_bars.empty:
+            open_today = float(today_bars["Open"].iloc[0])
+            result["open_today"]         = open_today
+            result["chg_from_open"]      = spot - open_today
+            result["chg_pct_from_open"]  = (spot - open_today) / open_today * 100
+
+        # 近5根K線方向動量
+        if len(df) >= 5:
+            last5 = df["Close"].iloc[-5:]
+            slope = (float(last5.iloc[-1]) - float(last5.iloc[0])) / float(last5.iloc[0]) * 100
+            if slope > 1.5:
+                result["trend_5bar"] = "up"
+            elif slope < -1.5:
+                result["trend_5bar"] = "down"
+            else:
+                result["trend_5bar"] = "flat"
+
+        # 綜合訊號：VIX漲→股市空，VIX跌→股市多
+        pct = result["chg_pct_from_prev"]
+        t5  = result["trend_5bar"]
+        if pct > 15 or (pct > 8 and t5 == "up"):
+            sig, lbl, col = -4, f"🚨 VIX暴升 {pct:+.1f}% → 極度恐慌，強力看空", "#ff2222"
+        elif pct > 5 or (pct > 2 and t5 == "up"):
+            sig, lbl, col = -2, f"🔴 VIX上升 {pct:+.1f}% → 恐慌升溫，偏空", "#ff6644"
+        elif pct > 0 and t5 == "flat":
+            sig, lbl, col = -1, f"🟡 VIX微升 {pct:+.1f}%，輕微壓力", "#ffaa44"
+        elif pct < -10 or (pct < -5 and t5 == "down"):
+            sig, lbl, col = +3, f"🟢 VIX急跌 {pct:+.1f}% → 恐慌消退，強力看多", "#00ee66"
+        elif pct < -2 or t5 == "down":
+            sig, lbl, col = +2, f"🟢 VIX下降 {pct:+.1f}% → 市場偏多", "#44cc88"
+        else:
+            sig, lbl, col = 0, f"⚪ VIX平穩 {pct:+.1f}%，市場中性", "#888888"
+
+        result["signal"]       = sig
+        result["signal_label"] = lbl
+        result["signal_color"] = col
+        result["trend_label"]  = {"up":"↑上升中","down":"↓下降中","flat":"→平穩"}[result["trend_5bar"]]
+
+    except Exception as e:
+        result["error"] = str(e)
+
+    return result
     """
     抓取 VIX 期限結構數據：
     - VIX 現貨 (^VIX)
@@ -3622,12 +3715,75 @@ def _render_mtf_confluence(symbol: str, mtf_data: dict):
     """
     多週期共振分析：短週期 + 長週期信號一致時，信號可靠性大幅提升。
     評分系統：每個條件 +1（多頭）或 -1（空頭），綜合判斷方向與強度。
+    VIX 作為全市場環境調節器：高恐慌壓制多頭訊號，低恐慌放大多頭訊號。
     """
     if len(mtf_data) < 2:
         return
 
+    # ── 0. 抓取 VIX 盤中即時數據（分鐘級，比日K更即時）────────────────────
+    try:
+        vix_intra    = fetch_vix_intraday()
+        vix_spot     = vix_intra.get("spot") or 20
+        vix_signal   = vix_intra.get("signal", 0)           # -4~+4，VIX下跌=正值
+        vix_sig_lbl  = vix_intra.get("signal_label", "")
+        vix_sig_col  = vix_intra.get("signal_color", "#888888")
+        vix_trend_lb = vix_intra.get("trend_label", "")
+        vix_pct      = vix_intra.get("chg_pct_from_prev", 0)
+
+        # 同時保留期限結構數據
+        vix_term     = fetch_vix_term_structure()
+        panic_type   = vix_term.get("panic_type", "normal")
+        vix_struct   = vix_term.get("structure", "unknown")
+        vix_ok       = True
+    except Exception:
+        vix_spot, vix_signal, vix_sig_lbl = 20, 0, ""
+        vix_sig_col, vix_trend_lb, vix_pct = "#888888", "", 0
+        panic_type, vix_struct = "normal", "unknown"
+        vix_ok = False
+
+    # ── VIX 環境調節（直接使用分鐘級信號）──────────────────────────────────
+    vix_momentum_score = vix_signal   # 已包含方向，VIX漲=負分，VIX跌=正分
+    vix_momentum_label = vix_sig_lbl
+    vix_momentum_color = vix_sig_col
+    #   暴升 >+15%  → 極度恐慌，強烈看空
+    # VIX 水位調節（保持不變）
+    if panic_type == "systemic" and vix_spot > 30:
+        vix_bull_multiplier = 0.40
+        vix_bear_multiplier = 1.50
+        vix_label = f"🔴 VIX系統風險 {vix_spot:.1f} Backwardation → 多頭訊號折扣60%"
+        vix_color = "#ff4444"
+    elif panic_type == "systemic":
+        vix_bull_multiplier = 0.60
+        vix_bear_multiplier = 1.30
+        vix_label = f"🟠 VIX系統風險 {vix_spot:.1f} Backwardation → 多頭訊號折扣40%"
+        vix_color = "#ff8844"
+    elif vix_spot > 25:
+        vix_bull_multiplier = 0.80
+        vix_bear_multiplier = 1.15
+        vix_label = f"🟡 VIX偏高 {vix_spot:.1f} → 多頭訊號折扣20%"
+        vix_color = "#ffcc44"
+    elif panic_type == "short_term":
+        vix_bull_multiplier = 1.15
+        vix_bear_multiplier = 0.85
+        vix_label = f"💛 VIX短期恐慌底 {vix_spot:.1f} Contango → 逢低機會，多頭+15%"
+        vix_color = "#ffee44"
+    elif vix_spot < 15 and vix_struct == "Contango":
+        vix_bull_multiplier = 1.20
+        vix_bear_multiplier = 0.90
+        vix_label = f"🟢 VIX極低 {vix_spot:.1f} Contango → 低恐慌環境，多頭+20%"
+        vix_color = "#00cc88"
+    elif vix_spot < 20:
+        vix_bull_multiplier = 1.10
+        vix_bear_multiplier = 0.95
+        vix_label = f"🟢 VIX正常 {vix_spot:.1f} → 市場平靜，訊號正常"
+        vix_color = "#44aa77"
+    else:
+        vix_bull_multiplier = 1.0
+        vix_bear_multiplier = 1.0
+        vix_label = f"⚪ VIX {vix_spot:.1f} → 中性環境"
+        vix_color = "#667788"
+
     # ── 1. 計算每個週期的多/空傾向分數 ──────────────────────────────────────
-    # 週期權重：越長週期權重越高（長線決定方向）
     weight_map = {"1m": 1, "5m": 2, "15m": 3, "30m": 4,
                   "1d": 6, "1wk": 8, "1mo": 10}
 
@@ -3640,14 +3796,12 @@ def _render_mtf_confluence(symbol: str, mtf_data: dict):
         w = weight_map.get(itvl, 2)
         total_weight += w
 
-        # 每週期評分項目
         s = 0
         reasons = []
         if d["trend"] == "多頭":    s += 2; reasons.append("多頭排列")
         elif d["trend"] == "空頭":  s -= 2; reasons.append("空頭排列")
         if d["dif"] > d["dea"]:     s += 1; reasons.append("MACD多方")
         else:                        s -= 1; reasons.append("MACD空方")
-        # MACD 金叉/死叉（剛發生）
         if d["dif"] > d["dea"] and d["dif_prev"] <= d["dea_prev"]:
             s += 2; reasons.append("剛金叉✨")
         elif d["dif"] < d["dea"] and d["dif_prev"] >= d["dea_prev"]:
@@ -3655,24 +3809,30 @@ def _render_mtf_confluence(symbol: str, mtf_data: dict):
         if d["ema5"] > d["ema20"]:  s += 1; reasons.append("短均多頭")
         else:                        s -= 1; reasons.append("短均空頭")
 
-        bull_score += max(0, s) * w
-        bear_score += max(0, -s) * w
+        # 套用 VIX 調節到各週期分數
+        s_adj = s * vix_bull_multiplier if s > 0 else s * vix_bear_multiplier
+        bull_score += max(0,  s_adj) * w
+        bear_score += max(0, -s_adj) * w
         period_signals.append({
             "itvl": itvl, "label": d["label"],
-            "score": s, "w": w, "reasons": reasons
+            "score": s, "score_adj": s_adj, "w": w, "reasons": reasons
         })
 
-    # ── 2. 共振強度計算 ────────────────────────────────────────────────────
-    max_possible = total_weight * 5   # 每週期最高 5 分
-    bull_pct = bull_score / max_possible * 100
-    bear_pct = bear_score / max_possible * 100
-    net_pct  = bull_pct - bear_pct    # 正=多頭優勢，負=空頭優勢
+    # ── 2. 共振強度計算（含 VIX 調節）──────────────────────────────────────
+    max_possible = total_weight * 5 * max(vix_bull_multiplier, vix_bear_multiplier)
+    bull_pct = bull_score / max_possible * 100 if max_possible else 0
+    bear_pct = bear_score / max_possible * 100 if max_possible else 0
+    net_pct  = bull_pct - bear_pct
 
-    # 判斷共振等級
-    # 各週期方向一致性（一致 = 共振強，分歧 = 信號弱）
-    bull_periods = sum(1 for p in period_signals if p["score"] > 0)
-    bear_periods = sum(1 for p in period_signals if p["score"] < 0)
-    total_periods = len(period_signals)
+    # VIX 動量作為獨立加減項（±4~±8 分，相當於一個強週期訊號）
+    # 直接加到 net_pct（每 1 分 ≈ 5% 影響）
+    vix_momentum_contribution = vix_momentum_score * 5
+    net_pct_raw    = net_pct   # 保留未調整值供顯示
+    net_pct       += vix_momentum_contribution
+
+    bull_periods   = sum(1 for p in period_signals if p["score"] > 0)
+    bear_periods   = sum(1 for p in period_signals if p["score"] < 0)
+    total_periods  = len(period_signals)
     consensus_ratio = max(bull_periods, bear_periods) / total_periods if total_periods else 0
 
     if net_pct > 25 and consensus_ratio >= 0.75:
@@ -3718,34 +3878,82 @@ def _render_mtf_confluence(symbol: str, mtf_data: dict):
 
     # ── 4. 渲染共振面板 ────────────────────────────────────────────────────
     bar_w  = min(100, abs(net_pct) * 2)
-    bar_dir = "left" if net_pct >= 0 else "right"
+
+    # VIX 壓力條（獨立顯示，視覺化調節幅度）
+    vix_bar_w = min(100, vix_spot * 2.5)   # VIX 40 → 100%
+    vix_adj_pct = abs(vix_bull_multiplier - 1.0) * 100
+    vix_adj_sign = "+" if vix_bull_multiplier > 1 else "-"
+    vix_adj_str = f"{vix_adj_sign}{vix_adj_pct:.0f}% 多頭" if vix_bull_multiplier != 1.0 else "中性"
 
     rows_html = ""
     for p in period_signals:
         _s    = p["score"]
+        _sadj = p.get("score_adj", _s)
         _col  = "#00cc66" if _s > 0 else ("#ff4444" if _s < 0 else "#888888")
-        _icon = "▲" if _s > 2 else ("△" if _s > 0 else ("▽" if _s < 0 else "▼" if _s < -2 else "◆"))
+        _icon = "▲" if _s > 2 else ("△" if _s > 0 else ("▼" if _s < -2 else ("▽" if _s < 0 else "◆")))
         _reasons = " · ".join(p["reasons"][:3])
+        # 若VIX調節改變了分數方向，顯示警告
+        _adj_note = ""
+        if vix_bull_multiplier != 1.0 and _s > 0:
+            _adj_note = f' <span style="color:{vix_color};font-size:0.65rem;">×{vix_bull_multiplier:.2f}</span>'
         rows_html += (
             f'<div style="display:flex;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid #1a2535;">'
             f'  <span style="color:#6688aa;min-width:38px;font-size:0.78rem;">{p["label"]}</span>'
             f'  <span style="color:{_col};font-weight:700;min-width:20px;">{_icon}</span>'
             f'  <div style="flex:1;background:#0d1520;border-radius:3px;height:5px;">'
-            f'    <div style="width:{min(100,abs(_s)*20)}%;height:100%;background:{_col};border-radius:3px;'
-            f'         margin-{"left" if _s >= 0 else "right"}:{"0" if _s >= 0 else "auto"};"></div>'
+            f'    <div style="width:{min(100,abs(_s)*20)}%;height:100%;background:{_col};border-radius:3px;"></div>'
             f'  </div>'
             f'  <span style="color:#445566;font-size:0.7rem;min-width:140px;">{_reasons}</span>'
+            f'  {_adj_note}'
             f'</div>'
         )
 
     div_html = (
         f'<div style="background:#0d1a2d;border:1px solid #1e3050;border-radius:8px;padding:12px 16px;margin:10px 0;">'
-        f'  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">'
+        # 標題列
+        f'  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">'
         f'    <span style="font-weight:700;font-size:1rem;color:#cce8ff;">🔗 多週期共振分析</span>'
         f'    <span style="background:{bar_color}22;border:1px solid {bar_color}55;'
         f'          color:{bar_color};padding:3px 10px;border-radius:12px;font-weight:700;">'
         f'      {confluence_label}</span>'
         f'  </div>'
+        # VIX 盤中即時動量列
+        f'  <div style="background:#0a1525;border:1px solid {vix_momentum_color}44;border-radius:6px;'
+        f'       padding:6px 10px;margin-bottom:6px;display:flex;align-items:center;gap:10px;">'
+        f'    <span style="color:{vix_momentum_color};font-size:0.75rem;font-weight:700;min-width:60px;">'
+        f'      📡 VIX即時</span>'
+        f'    <span style="color:{vix_momentum_color};font-size:0.82rem;font-weight:700;">'
+        f'      {vix_spot:.2f}　{vix_trend_lb}　{vix_pct:+.1f}%</span>'
+        f'    <span style="color:{vix_momentum_color};font-size:0.78rem;flex:1;">'
+        f'      　{vix_momentum_label}</span>'
+        f'  </div>'
+        # VIX 期限結構環境列
+        f'  <div style="background:#0a1525;border:1px solid {vix_color}44;border-radius:6px;'
+        f'       padding:6px 10px;margin-bottom:10px;display:flex;align-items:center;gap:10px;">'
+        f'    <span style="color:{vix_color};font-size:0.75rem;font-weight:700;min-width:60px;">'
+        f'      📊 VIX環境</span>'
+        f'    <div style="flex:1;background:#0d1520;border-radius:3px;height:6px;">'
+        f'      <div style="width:{vix_bar_w:.0f}%;height:100%;background:linear-gradient(90deg,#44aa77,#ffcc44,#ff4444);'
+        f'           border-radius:3px;"></div>'
+        f'      <div style="width:2px;height:10px;background:#fff3;position:relative;'
+        f'           margin-top:-8px;left:{min(98,vix_bar_w):.0f}%;"></div>'
+        f'    </div>'
+        f'    <span style="color:{vix_color};font-size:0.78rem;min-width:260px;">'
+        f'      {vix_label}　<span style="color:#667788;">({vix_adj_str})</span></span>'
+        f'  </div>'
+        # 多空強度條
+        f'  <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">'
+        f'    <span style="color:#445566;font-size:0.75rem;">空頭</span>'
+        f'    <div style="flex:1;background:#0d1520;border-radius:4px;height:8px;position:relative;">'
+        f'      <div style="width:{bar_w/2}%;height:100%;background:{bar_color};border-radius:4px;'
+        f'           position:absolute;{"left:50%" if net_pct>=0 else f"left:{50-bar_w/2}%"};"></div>'
+        f'      <div style="width:1px;height:100%;background:#445566;position:absolute;left:50%;"></div>'
+        f'    </div>'
+        f'    <span style="color:#445566;font-size:0.75rem;">多頭</span>'
+        f'    <span style="color:{bar_color};font-weight:700;min-width:60px;text-align:right;">'
+        f'      {direction} {abs(net_pct):.0f}%</span>'
+        f'  </div>'
+        f'  {rows_html}'
         f'  <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">'
         f'    <span style="color:#445566;font-size:0.75rem;">空頭</span>'
         f'    <div style="flex:1;background:#0d1520;border-radius:4px;height:8px;position:relative;">'
