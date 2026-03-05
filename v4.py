@@ -2068,6 +2068,8 @@ def calc_trendline(df, mode="high", lookback=60, min_points=2):
     except Exception:
         pass
     return result
+
+def detect_trend(df) -> str:
     if len(df) < 60: return "盤整"
     c = df["Close"]
     e5, e20, e60 = calc_ema(c,5).iloc[-1], calc_ema(c,20).iloc[-1], calc_ema(c,60).iloc[-1]
