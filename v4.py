@@ -2664,16 +2664,85 @@ def run_alerts(symbol, period_label, df, trigger_ai=False, mkt=None):
     if len(rsi_series.dropna()) >= 5:
         rsi_now  = float(rsi_series.iloc[-1])
         rsi_prev = float(rsi_series.iloc[-2])
-        # RSI 從超賣區(<30)回升穿越30
+        rsi_3ago = float(rsi_series.iloc[-4]) if len(rsi_series) >= 4 else rsi_prev
+
+        # ── C3b-1. RSI 從超賣穿越30（底部反彈確認）
         if rsi_prev < 30 and rsi_now >= 30:
             add_alert(symbol, period_label,
                       f"🟢 反轉訊號｜RSI 超賣回升穿越30 ({rsi_now:.1f}) 潛在底部反彈", "bull")
             new_signals.append(f"RSI超賣回升{rsi_now:.0f}")
-        # RSI 從超買區(>70)回落穿越70
+
+        # ── C3b-2. RSI 從超買回落穿越70（頂部預警）
         elif rsi_prev > 70 and rsi_now <= 70:
             add_alert(symbol, period_label,
                       f"🔴 反轉訊號｜RSI 超買回落穿越70 ({rsi_now:.1f}) 潛在頂部回撤", "bear")
             new_signals.append(f"RSI超買回落{rsi_now:.0f}")
+
+        # ── C3b-3. RSI 持續在超買區且仍上升（強勢延伸，圖右側74的場景）
+        elif rsi_now > 70 and rsi_prev > 70 and rsi_now > rsi_prev:
+            ck = f"{symbol}|{period_label}|RSI超買強勢延伸|{df.index[-1].strftime('%Y%m%d%H') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:13]}"
+            if ck not in st.session_state.sent_alerts:
+                st.session_state.sent_alerts.add(ck)
+                add_alert(symbol, period_label,
+                          f"🚀 【RSI超買強勢】RSI={rsi_now:.1f} 持續在超買區且仍上升"
+                          f"，強勢趨勢延伸中，不宜輕易做空，但注意高位風險！", "bull")
+                new_signals.append(f"RSI超買強勢延伸{rsi_now:.0f}")
+
+        # ── C3b-4. RSI 持續在超賣區且仍下降（弱勢延伸，繼續下跌）
+        elif rsi_now < 30 and rsi_prev < 30 and rsi_now < rsi_prev:
+            ck = f"{symbol}|{period_label}|RSI超賣弱勢延伸|{df.index[-1].strftime('%Y%m%d%H') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:13]}"
+            if ck not in st.session_state.sent_alerts:
+                st.session_state.sent_alerts.add(ck)
+                add_alert(symbol, period_label,
+                          f"💀 【RSI超賣弱勢】RSI={rsi_now:.1f} 持續在超賣區且仍下降"
+                          f"，弱勢延伸，避免接刀！等待RSI回升再考慮入場。", "bear")
+                new_signals.append(f"RSI超賣弱勢延伸{rsi_now:.0f}")
+
+        # ── C3b-5. RSI 底背離（價格新低但RSI未新低，圖中底部反彈前的最早期訊號）
+        if len(rsi_series.dropna()) >= 20:
+            _rsi20 = rsi_series.dropna().iloc[-20:]
+            _close20 = close.iloc[-20:]
+            # 找兩個低點
+            _rsi_min_idx  = int(_rsi20.values.argmin())
+            _price_min_idx = int(_close20.values.argmin())
+            # 如果價格低點比RSI低點更靠後（更近期），且價格更低但RSI更高 → 底背離
+            if (_price_min_idx > _rsi_min_idx + 2
+                    and float(_close20.iloc[-1]) > float(_close20.iloc[_price_min_idx])  # 已離底
+                    and float(_rsi20.iloc[_price_min_idx]) > float(_rsi20.iloc[_rsi_min_idx]) * 0.98):
+                _rsi_at_bottom = float(_rsi20.iloc[_price_min_idx])
+                _rsi_at_first  = float(_rsi20.iloc[_rsi_min_idx])
+                if _rsi_at_bottom > _rsi_at_first * 1.05:  # RSI底背離確認
+                    ck = f"{symbol}|{period_label}|RSI底背離|{df.index[-1].strftime('%Y%m%d%H') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:13]}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        add_alert(symbol, period_label,
+                                  f"📈 【RSI底背離】價格創新低但RSI未創新低"
+                                  f"（RSI底={_rsi_at_first:.1f}→{_rsi_at_bottom:.1f}）"
+                                  f"，反彈動能醞釀中！", "bull")
+                        new_signals.append(f"RSI底背離")
+
+    # C3c. MACD 從深負值金叉（圖中底部最強反轉訊號）
+    # 普通金叉 vs 深負值金叉：深負值代表空頭積累能量更多，反轉力度更強
+    if len(close) >= 30:
+        _dif_c = float(dif.iloc[-1]); _dea_c = float(dea.iloc[-1])
+        _dif_p = float(dif.iloc[-2]); _dea_p = float(dea.iloc[-2])
+        _golden_cross = _dif_c > _dea_c and _dif_p <= _dea_p
+        if _golden_cross:
+            # 找金叉前的DIF最低點（代表下跌深度）
+            _dif_min = float(dif.iloc[-30:].min())
+            if _dif_min < -0.5:   # 深負值金叉（之前跌很深）
+                ck = f"{symbol}|{period_label}|MACD深谷金叉|{df.index[-1].strftime('%Y%m%d%H') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:13]}"
+                if ck not in st.session_state.sent_alerts:
+                    st.session_state.sent_alerts.add(ck)
+                    if _dif_min < -1.0:
+                        _depth_lbl = f"極深谷({_dif_min:.3f})"
+                    else:
+                        _depth_lbl = f"深谷({_dif_min:.3f})"
+                    add_alert(symbol, period_label,
+                              f"🔔 【MACD深谷金叉】MACD從{_depth_lbl}完成金叉"
+                              f"（DIF={_dif_c:.3f} 上穿 DEA={_dea_c:.3f}）"
+                              f"，深度越深反轉力度越強，底部反彈確認！", "bull")
+                    new_signals.append(f"MACD深谷金叉{_dif_min:.2f}")
 
     # C4. EMA5/EMA10 黃金/死亡交叉（短線反轉確認）
     if e5.iloc[-1] > e10.iloc[-1] and e5.iloc[-2] <= e10.iloc[-2]:
