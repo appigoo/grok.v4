@@ -2280,7 +2280,63 @@ def run_alerts(symbol, period_label, df, trigger_ai=False, mkt=None):
 
     e30 = calc_ema(close, 30)
 
-    # ── E1. 最早期：MACD 負值底背離 + DIF 斜率轉正（空頭動能衰竭）────────
+    # ── E0. 最最早期：空頭排列低點反彈第一根（箭頭形態）──────────────────
+    # 條件：
+    #   1. 均線仍是空頭排列（EMA5 < EMA20）
+    #   2. 近N根出現明顯低點（比前5根都低）
+    #   3. 當前K線是陽線（開<收）
+    #   4. 收盤開始從低點反彈（比低點高）
+    #   5. 量能相對前幾根開始放大（底部量）
+    if len(close) >= 15:
+        try:
+            _e0_e5  = float(e5.iloc[-1])
+            _e0_e20 = float(e20.iloc[-1])
+            _e0_e5p = float(e5.iloc[-2])
+
+            # 仍是空頭排列（EMA5 < EMA20）
+            _e0_bear_align = _e0_e5 < _e0_e20
+
+            # 當前K線是陽線
+            _e0_open  = float(df["Open"].iloc[-1]) if "Open" in df.columns else float(close.iloc[-1])
+            _e0_price = float(close.iloc[-1])
+            _e0_bull_bar = _e0_price > _e0_open
+
+            # 近10根內有明顯低點（V底）
+            _e0_recent = close.iloc[-10:]
+            _e0_low_idx = int(_e0_recent.values.argmin())
+            _e0_low_val = float(_e0_recent.min())
+            _e0_recovery = (_e0_price - _e0_low_val) / _e0_low_val * 100
+            _e0_v_shape  = _e0_low_idx >= 2 and _e0_low_idx <= 8  # 低點在近期，已反彈
+            _e0_enough_recovery = _e0_recovery > 0.15  # 已反彈至少0.15%
+
+            # EMA5 斜率開始向上（剛止跌）
+            _e0_e5_turning = _e0_e5 >= _e0_e5p  # EMA5 不再下降
+
+            # DIF 斜率轉正（動能轉向）
+            _e0_dif_turn = float(dif.iloc[-1]) > float(dif.iloc[-2])
+
+            # 量能相對前3根放大（底部放量）
+            _e0_vol_now  = float(vol.iloc[-1])
+            _e0_vol_prev = float(vol.iloc[-4:-1].mean()) if len(vol) >= 4 else _e0_vol_now
+            _e0_vol_expand = _e0_vol_now >= _e0_vol_prev * 0.8  # 量能不萎縮即可
+
+            if (_e0_bear_align and _e0_bull_bar and _e0_v_shape
+                    and _e0_enough_recovery and _e0_e5_turning
+                    and _e0_dif_turn and _e0_vol_expand):
+                ck = f"{symbol}|{period_label}|空頭底部反彈|{df.index[-1].strftime('%Y%m%d%H%M') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:16]}"
+                if ck not in st.session_state.sent_alerts:
+                    st.session_state.sent_alerts.add(ck)
+                    _e0_tags = [f"低點{_e0_low_val:.2f}已反彈+{_e0_recovery:.2f}%"]
+                    if _e0_dif_turn: _e0_tags.append("DIF轉向↑")
+                    if _e0_e5_turning: _e0_tags.append("EMA5止跌")
+                    add_alert(symbol, period_label,
+                              f"🟡 【底部反彈初訊】空頭排列中低點反彈第一根陽線"
+                              f"（低點{_e0_low_val:.2f}→現價{_e0_price:.2f}，+{_e0_recovery:.2f}%）"
+                              f"，EMA5止跌＋DIF轉向，均線翻多前最早期入場機會"
+                              f"｜{'＋'.join(_e0_tags)}，注意確認後再加倉！", "bull")
+                    new_signals.append(f"底部反彈初訊+{_e0_recovery:.2f}%")
+        except Exception:
+            pass
     if len(close) >= 20:
         # MACD 深負值後連續3根收縮（對應圖中 MACD 從 -0.48 開始回升）
         hist_neg_shrink = (
@@ -3002,8 +3058,65 @@ def run_alerts(symbol, period_label, df, trigger_ai=False, mkt=None):
             except Exception:
                 pass
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # H. 量能爆發 + 均線多頭排列（圖中 21:00 場景）
+        # ── G6. 均線聚合中縮量陰線回測不破（最佳低風險買入點）───────────────
+        # 圖中箭頭形態：
+        #   - 均線已極度壓縮（所有EMA在0.3%以內）
+        #   - 出現一根陰線（小回測）
+        #   - 收盤仍在 EMA20 支撐上方
+        #   - DIF 向上（底背離醞釀）
+        #   - 這根陰線之後 = 低風險買入窗口
+        if len(close) >= 20:
+            try:
+                _g6_e5  = float(calc_ema(close, 5).iloc[-1])
+                _g6_e10 = float(calc_ema(close, 10).iloc[-1])
+                _g6_e20 = float(calc_ema(close, 20).iloc[-1])
+                _g6_e30 = float(calc_ema(close, 30).iloc[-1])
+                _g6_e60 = float(calc_ema(close, 60).iloc[-1])
+                _g6_emas = [_g6_e5, _g6_e10, _g6_e20, _g6_e30, _g6_e60]
+                _g6_mean = sum(_g6_emas) / len(_g6_emas)
+                _g6_spread = (max(_g6_emas) - min(_g6_emas)) / _g6_mean * 100
+
+                _g6_price  = float(close.iloc[-1])
+                _g6_open   = float(df["Open"].iloc[-1]) if "Open" in df.columns else _g6_price
+                _g6_is_bear_bar = _g6_price < _g6_open   # 陰線
+
+                _g6_dif, _g6_dea, _ = calc_macd(close)
+                _g6_dif_now  = float(_g6_dif.iloc[-1])
+                _g6_dif_prev = float(_g6_dif.iloc[-2])
+                _g6_dif_rising = _g6_dif_now > _g6_dif_prev
+
+                # 均線聚合 + 陰線回測 + 不破EMA20支撐 + DIF向上
+                _g6_support_hold = _g6_price > _g6_e20 * 0.9992  # 距EMA20不超過0.08%
+                _g6_above_mid    = _g6_price > _g6_mean * 0.9995 # 仍在均線叢中/上方
+
+                # 前幾根均線方向：至少EMA5在上升趨勢
+                _g6_e5_prev = float(calc_ema(close, 5).iloc[-3])
+                _g6_uptrend = _g6_e5 >= _g6_e5_prev  # EMA5 不是在下降
+
+                if (_g6_spread < 0.30          # 均線高度聚合
+                        and _g6_is_bear_bar     # 這根是陰線
+                        and _g6_support_hold    # 收盤守住EMA20
+                        and _g6_above_mid       # 在均線叢中上方
+                        and _g6_dif_rising      # DIF向上（動能醞釀）
+                        and _g6_uptrend):       # 短期趨勢向上
+
+                    ck = f"{symbol}|{period_label}|聚合縮量回測買點|{df.index[-1].strftime('%Y%m%d%H%M') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:16]}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        _tag_list = [f"壓縮{_g6_spread:.3f}%", f"EMA20支撐{_g6_e20:.2f}"]
+                        if _g6_dif_now < 0:
+                            _tag_list.append("DIF負值向上↑（底背離醞釀）")
+                        else:
+                            _tag_list.append("DIF正值向上↑")
+                        add_alert(symbol, period_label,
+                                  f"🎯 【聚合回測買點】均線極度壓縮({_g6_spread:.3f}%)"
+                                  f"，陰線回測守住EMA20({_g6_e20:.2f})"
+                                  f"，DIF向上醞釀突破"
+                                  f"｜{'＋'.join(_tag_list)}"
+                                  f"，低風險買入窗口！", "bull")
+                        new_signals.append(f"聚合回測買點{_g6_spread:.3f}%")
+            except Exception:
+                pass
     #    量能從低迷突然暴增，同時 EMA 已完成多頭/空頭排列 → 趨勢加速訊號
     # ══════════════════════════════════════════════════════════════════════════
     try:
