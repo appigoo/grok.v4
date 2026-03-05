@@ -2009,11 +2009,6 @@ def calc_trendline(df, mode="high", lookback=60, min_points=2):
       breakout: bool（當前價格是否突破趨勢線）
       distance_pct: 當前價格距趨勢線的百分比
     """
-    try:
-        from scipy import stats as _stats
-    except ImportError:
-        return None
-
     result = {"slope": None, "intercept": None, "r2": None,
               "current_val": None, "points": [], "breakout": False,
               "distance_pct": 0, "valid": False}
@@ -2049,7 +2044,14 @@ def calc_trendline(df, mode="high", lookback=60, min_points=2):
         use_pts = merged[-5:]
         xs = [p[0] for p in use_pts]
         ys = [p[1] for p in use_pts]
-        slope, intercept, r, _, _ = _stats.linregress(xs, ys)
+        # 用 numpy polyfit 做線性回歸（不依賴 scipy）
+        coeffs = np.polyfit(xs, ys, 1)
+        slope, intercept = float(coeffs[0]), float(coeffs[1])
+        # 計算 R²
+        ys_pred = [slope*x + intercept for x in xs]
+        ss_res = sum((y-yp)**2 for y,yp in zip(ys,ys_pred))
+        ss_tot = sum((y-sum(ys)/len(ys))**2 for y in ys)
+        r = (1 - ss_res/ss_tot)**0.5 if ss_tot > 0 else 0
 
         # 當前趨勢線值
         cur_bar = len(sub) - 1
