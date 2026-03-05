@@ -2009,6 +2009,11 @@ def calc_trendline(df, mode="high", lookback=60, min_points=2):
       breakout: bool（當前價格是否突破趨勢線）
       distance_pct: 當前價格距趨勢線的百分比
     """
+    try:
+        from scipy import stats as _stats
+    except ImportError:
+        return None
+
     result = {"slope": None, "intercept": None, "r2": None,
               "current_val": None, "points": [], "breakout": False,
               "distance_pct": 0, "valid": False}
@@ -2044,14 +2049,7 @@ def calc_trendline(df, mode="high", lookback=60, min_points=2):
         use_pts = merged[-5:]
         xs = [p[0] for p in use_pts]
         ys = [p[1] for p in use_pts]
-        # 用 numpy polyfit 做線性回歸（不依賴 scipy）
-        coeffs = np.polyfit(xs, ys, 1)
-        slope, intercept = float(coeffs[0]), float(coeffs[1])
-        # 計算 R²
-        ys_pred = [slope*x + intercept for x in xs]
-        ss_res = sum((y-yp)**2 for y,yp in zip(ys,ys_pred))
-        ss_tot = sum((y-sum(ys)/len(ys))**2 for y in ys)
-        r = (1 - ss_res/ss_tot)**0.5 if ss_tot > 0 else 0
+        slope, intercept, r, _, _ = _stats.linregress(xs, ys)
 
         # 當前趨勢線值
         cur_bar = len(sub) - 1
@@ -3458,92 +3456,7 @@ def run_alerts(symbol, period_label, df, trigger_ai=False, mkt=None):
 
     except Exception:
         pass
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # L. 箱體突破偵測（長期橫盤後向上/向下突破阻力/支撐）
-    # ══════════════════════════════════════════════════════════════════════════
-    try:
-        if len(df) >= 25:
-            _l_close = df["Close"]
-            _l_price = float(_l_close.iloc[-1])
-
-            def _calc_box(series, window=20, exclude_recent=3):
-                base = series.iloc[-(window + exclude_recent):-exclude_recent]
-                if len(base) < 5: return None
-                hi = float(base.max()); lo = float(base.min()); mid = float(base.mean())
-                return {"high": hi, "low": lo, "mid": mid,
-                        "range_pct": (hi-lo)/mid*100, "bars": len(base)}
-
-            # 找最緊的盤整窗口
-            _best_box = None
-            for _w in [10, 15, 20, 25]:
-                _box = _calc_box(_l_close, window=_w)
-                if _box and _box["range_pct"] < 1.8:
-                    if _best_box is None or _box["range_pct"] < _best_box["range_pct"]:
-                        _best_box = _box; _best_box["window"] = _w
-
-            if _best_box:
-                _bhi = _best_box["high"]; _blo = _best_box["low"]
-                _brng = _best_box["range_pct"]; _bw = _best_box["window"]
-
-                _l_vol_now = float(vol.iloc[-1])
-                _l_vol_ma  = float(vol.iloc[-10:-1].mean()) if len(vol) >= 11 else _l_vol_now
-                _l_vol_x   = _l_vol_now / _l_vol_ma if _l_vol_ma > 0 else 1
-
-                _le5 = float(calc_ema(_l_close, 5).iloc[-1])
-                _le10= float(calc_ema(_l_close, 10).iloc[-1])
-                _le20= float(calc_ema(_l_close, 20).iloc[-1])
-                _le30= float(calc_ema(_l_close, 30).iloc[-1])
-                _l_bull_align = _le5 > _le10 > _le20 > _le30
-                _l_bear_align = _le5 < _le10 < _le20 < _le30
-
-                _ldif, _ldea, _ = calc_macd(_l_close)
-                _l_dif_above = float(_ldif.iloc[-1]) > float(_ldea.iloc[-1])
-                _l_dif_below = float(_ldif.iloc[-1]) < float(_ldea.iloc[-1])
-
-                _l_break_up_pct = (_l_price - _bhi) / _bhi * 100
-                _l_break_dn_pct = (_l_price - _blo) / _blo * 100
-
-                # ── L1. 向上突破箱體 ─────────────────────────────────────────
-                if (_l_price > _bhi * 1.003 and _l_break_up_pct < 5.0
-                        and _l_vol_x >= 1.5 and _l_bull_align and _l_dif_above):
-                    ck = f"{symbol}|{period_label}|箱體向上突破|{df.index[-1].strftime('%Y%m%d%H%M') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:16]}"
-                    if ck not in st.session_state.sent_alerts:
-                        st.session_state.sent_alerts.add(ck)
-                        _pfx = "🚀🚀 【超強" if _l_vol_x >= 5 else "🚀 【"
-                        add_alert(symbol, period_label,
-                                  f"{_pfx}箱體向上突破】橫盤{_bw}根"
-                                  f"（箱頂{_bhi:.2f}，波動{_brng:.3f}%）"
-                                  f"→ 放量×{_l_vol_x:.1f}突破至{_l_price:.2f}（+{_l_break_up_pct:.2f}%）"
-                                  f"，均線多頭排列＋MACD翻正，阻力轉支撐，可積極追進！", "bull")
-                        new_signals.append(f"箱體突破+{_l_break_up_pct:.2f}%×{_l_vol_x:.0f}倍量")
-
-                # ── L2. 向下跌破箱體 ─────────────────────────────────────────
-                elif (_l_price < _blo * 0.997 and _l_break_dn_pct > -5.0
-                        and _l_vol_x >= 1.5 and _l_bear_align and _l_dif_below):
-                    ck = f"{symbol}|{period_label}|箱體向下跌破|{df.index[-1].strftime('%Y%m%d%H%M') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:16]}"
-                    if ck not in st.session_state.sent_alerts:
-                        st.session_state.sent_alerts.add(ck)
-                        add_alert(symbol, period_label,
-                                  f"💀 【箱體向下跌破】橫盤{_bw}根"
-                                  f"（箱底{_blo:.2f}，波動{_brng:.3f}%）"
-                                  f"→ 放量×{_l_vol_x:.1f}跌破至{_l_price:.2f}（{_l_break_dn_pct:.2f}%）"
-                                  f"，均線空頭排列＋MACD翻負，支撐轉阻力！", "bear")
-                        new_signals.append(f"箱體跌破{_l_break_dn_pct:.2f}%×{_l_vol_x:.0f}倍量")
-
-                # ── L3. 超長橫盤蓄勢預警 ─────────────────────────────────────
-                elif _brng < 0.4 and _bw >= 12:
-                    ck = f"{symbol}|{period_label}|超長橫盤預警|{df.index[-1].strftime('%Y%m%d%H') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:13]}"
-                    if ck not in st.session_state.sent_alerts:
-                        st.session_state.sent_alerts.add(ck)
-                        add_alert(symbol, period_label,
-                                  f"⏳ 【蓄勢待發】橫盤已{_bw}根，波動僅{_brng:.3f}%"
-                                  f"（{_blo:.2f}-{_bhi:.2f}）"
-                                  f"，能量極度壓縮，隨時可能方向性突破，密切監控！", "bull")
-                        new_signals.append(f"超長橫盤{_bw}根{_brng:.3f}%")
-
-    except Exception:
-        pass
+    if not new_signals or not trigger_ai:
         return
     if not get_groq_key():
         return
@@ -4270,8 +4183,7 @@ def _render_mtf_confluence(symbol: str, mtf_data: dict):
            f'       color:#ffaa44;font-size:0.8rem;">{divergence_msg}</div>' if divergence_msg else '')
         + f'</div>'
     )
-    st.markdown(f'<div id="mtf-confluence-{symbol}">{div_html}</div>',
-                unsafe_allow_html=True)
+    st.markdown(div_html, unsafe_allow_html=True)
 
 
 def render_mtf_summary(symbol, selected_intervals, show_alerts, prepost=False):
@@ -4362,8 +4274,7 @@ def render_mtf_summary(symbol, selected_intervals, show_alerts, prepost=False):
             f'  {compress_tag}'
             f'</div>'
         )
-    st.markdown(f'<div id="mtf-rows-{symbol}">{"".join(rows)}</div>',
-                unsafe_allow_html=True)
+    st.markdown("".join(rows), unsafe_allow_html=True)
 
     # ── 多週期共振分析（跨週期連動預測）────────────────────────────────────
     if len(mtf_data) >= 2:
@@ -4771,8 +4682,7 @@ if st.session_state.alert_log:
             f'</div></div>'
         )
     all_cards.append('</div>')
-    st.markdown(f'<div id="alert-cards-panel">{"".join(all_cards)}</div>',
-                unsafe_allow_html=True)
+    st.markdown("".join(all_cards), unsafe_allow_html=True)
 
     # ── 整體市場情緒 ─────────────────────────────────────────────────────────
     total_bull = sum(v["bull"] for v in sym_stats.values())
