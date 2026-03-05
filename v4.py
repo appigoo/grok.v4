@@ -4268,7 +4268,8 @@ def _render_mtf_confluence(symbol: str, mtf_data: dict):
            f'       color:#ffaa44;font-size:0.8rem;">{divergence_msg}</div>' if divergence_msg else '')
         + f'</div>'
     )
-    st.markdown(div_html, unsafe_allow_html=True)
+    st.markdown(f'<div id="mtf-confluence-{symbol}">{div_html}</div>',
+                unsafe_allow_html=True)
 
 
 def render_mtf_summary(symbol, selected_intervals, show_alerts, prepost=False):
@@ -4359,7 +4360,8 @@ def render_mtf_summary(symbol, selected_intervals, show_alerts, prepost=False):
             f'  {compress_tag}'
             f'</div>'
         )
-    st.markdown("".join(rows), unsafe_allow_html=True)
+    st.markdown(f'<div id="mtf-rows-{symbol}">{"".join(rows)}</div>',
+                unsafe_allow_html=True)
 
     # ── 多週期共振分析（跨週期連動預測）────────────────────────────────────
     if len(mtf_data) >= 2:
@@ -4767,7 +4769,8 @@ if st.session_state.alert_log:
             f'</div></div>'
         )
     all_cards.append('</div>')
-    st.markdown("".join(all_cards), unsafe_allow_html=True)
+    st.markdown(f'<div id="alert-cards-panel">{"".join(all_cards)}</div>',
+                unsafe_allow_html=True)
 
     # ── 整體市場情緒 ─────────────────────────────────────────────────────────
     total_bull = sum(v["bull"] for v in sym_stats.values())
