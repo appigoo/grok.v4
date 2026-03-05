@@ -1999,7 +1999,75 @@ def calc_pivot(df, interval: str = "1d"):
 
     return highs, lows
 
-def detect_trend(df) -> str:
+def calc_trendline(df, mode="high", lookback=60, min_points=2):
+    """
+    計算下降趨勢線（mode='high'）或上升趨勢線（mode='low'）。
+    用最近 lookback 根K線的局部高/低點做線性回歸。
+    返回 dict:
+      slope, intercept, r2, current_val,
+      points: [(bar_idx, price), ...],
+      breakout: bool（當前價格是否突破趨勢線）
+      distance_pct: 當前價格距趨勢線的百分比
+    """
+    try:
+        from scipy import stats as _stats
+    except ImportError:
+        return None
+
+    result = {"slope": None, "intercept": None, "r2": None,
+              "current_val": None, "points": [], "breakout": False,
+              "distance_pct": 0, "valid": False}
+    try:
+        n = min(lookback, len(df))
+        sub = df.iloc[-n:]
+        col = "High" if mode == "high" else "Low"
+        vals = sub[col].values if col in sub.columns else sub["Close"].values
+        price_col = sub["Close"].values
+
+        # 找局部極值點（窗口=3）
+        pts = []
+        for i in range(2, len(vals)-2):
+            if mode == "high":
+                if vals[i] >= max(vals[max(0,i-3):i+1]) and vals[i] >= max(vals[i:min(len(vals),i+4)]):
+                    pts.append((i, float(vals[i])))
+            else:
+                if vals[i] <= min(vals[max(0,i-3):i+1]) and vals[i] <= min(vals[i:min(len(vals),i+4)]):
+                    pts.append((i, float(vals[i])))
+
+        # 合併過近的點（保留更極端的）
+        merged = []
+        for idx, v in pts:
+            if not merged or idx - merged[-1][0] >= 5:
+                merged.append((idx, v))
+            elif (mode == "high" and v > merged[-1][1]) or (mode == "low" and v < merged[-1][1]):
+                merged[-1] = (idx, v)
+
+        if len(merged) < min_points:
+            return result
+
+        # 只用最近的幾個點做回歸（最多5個）
+        use_pts = merged[-5:]
+        xs = [p[0] for p in use_pts]
+        ys = [p[1] for p in use_pts]
+        slope, intercept, r, _, _ = _stats.linregress(xs, ys)
+
+        # 當前趨勢線值
+        cur_bar = len(sub) - 1
+        cur_val = slope * cur_bar + intercept
+        cur_price = float(price_col[-1])
+
+        breakout = (cur_price > cur_val) if mode == "high" else (cur_price < cur_val)
+        dist_pct = (cur_price - cur_val) / cur_val * 100
+
+        result.update({
+            "slope": slope, "intercept": intercept, "r2": r**2,
+            "current_val": cur_val, "points": use_pts,
+            "breakout": breakout, "distance_pct": dist_pct,
+            "cur_price": cur_price, "valid": r**2 >= 0.5
+        })
+    except Exception:
+        pass
+    return result
     if len(df) < 60: return "盤整"
     c = df["Close"]
     e5, e20, e60 = calc_ema(c,5).iloc[-1], calc_ema(c,20).iloc[-1], calc_ema(c,60).iloc[-1]
@@ -3298,7 +3366,94 @@ def run_alerts(symbol, period_label, df, trigger_ai=False, mkt=None):
     except Exception:
         pass
 
-    # ── 有新信號且啟用 AI → 自動觸發 Groq 分析 ─────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # K. 趨勢線突破 + 水平支撐/阻力偵測（日K圖三點下降壓力線場景）
+    # ══════════════════════════════════════════════════════════════════════════
+    try:
+        if len(df) >= 20:
+            _k_close = df["Close"]
+            _k_price = float(_k_close.iloc[-1])
+
+            # ── K1. 下降趨勢線突破（由空轉多的關鍵訊號）────────────────────
+            _tl_down = calc_trendline(df, mode="high", lookback=min(80, len(df)), min_points=2)
+            if _tl_down and _tl_down["valid"]:
+                _tl_val  = _tl_down["current_val"]
+                _tl_dist = _tl_down["distance_pct"]
+                _tl_r2   = _tl_down["r2"]
+                _tl_slope= _tl_down["slope"]
+                _tl_pts  = len(_tl_down["points"])
+
+                # 突破下降趨勢線（上方 0~3%）
+                if _tl_down["breakout"] and 0 < _tl_dist < 3.0:
+                    ck = f"{symbol}|{period_label}|下降趨勢線突破|{df.index[-1].strftime('%Y%m%d') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:10]}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        _slope_str = f"{_tl_slope*5:.2f}/週" if "日" in period_label or "1d" in period_label else f"{_tl_slope:.3f}/根"
+                        add_alert(symbol, period_label,
+                                  f"🚀 【趨勢線突破】突破{_tl_pts}點下降壓力線"
+                                  f"（趨勢線={_tl_val:.2f}，當前={_k_price:.2f}，距離+{_tl_dist:.2f}%）"
+                                  f"，斜率{_slope_str}，R²={_tl_r2:.2f}"
+                                  f"，空頭格局可能終結，注意量能確認！", "bull")
+                        new_signals.append(f"下降趨勢線突破+{_tl_dist:.2f}%")
+
+                # 接近下降趨勢線壓力（上方 -1% 到 0）
+                elif not _tl_down["breakout"] and -1.5 < _tl_dist < 0:
+                    ck = f"{symbol}|{period_label}|接近下降趨勢線|{df.index[-1].strftime('%Y%m%d') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:10]}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        add_alert(symbol, period_label,
+                                  f"⚠️ 【趨勢線壓力】接近{_tl_pts}點下降壓力線"
+                                  f"（趨勢線={_tl_val:.2f}，當前={_k_price:.2f}，距{abs(_tl_dist):.2f}%）"
+                                  f"，注意阻力，突破前謹慎追漲！", "bear")
+                        new_signals.append(f"接近下降趨勢線{_tl_dist:.2f}%")
+
+            # ── K2. 上升趨勢線跌破（由多轉空的關鍵訊號）────────────────────
+            _tl_up = calc_trendline(df, mode="low", lookback=min(80, len(df)), min_points=2)
+            if _tl_up and _tl_up["valid"]:
+                _tlu_val  = _tl_up["current_val"]
+                _tlu_dist = _tl_up["distance_pct"]
+                _tlu_pts  = len(_tl_up["points"])
+
+                if _tl_up["breakout"] and -3.0 < _tlu_dist < 0:
+                    ck = f"{symbol}|{period_label}|上升趨勢線跌破|{df.index[-1].strftime('%Y%m%d') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:10]}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        add_alert(symbol, period_label,
+                                  f"💀 【趨勢線跌破】跌破{_tlu_pts}點上升支撐線"
+                                  f"（趨勢線={_tlu_val:.2f}，當前={_k_price:.2f}，{_tlu_dist:.2f}%）"
+                                  f"，多頭格局破壞，注意下行風險！", "bear")
+                        new_signals.append(f"上升趨勢線跌破{_tlu_dist:.2f}%")
+
+            # ── K3. 水平支撐反彈（多次測試後反彈，圖中390-395支撐帶）────────
+            if len(_k_close) >= 30:
+                # 找近30根的支撐帶（多次觸及的水平區間）
+                _k_lows = sorted([float(_k_close.iloc[i]) for i in range(-30, 0)])
+                _k_support_zone_low  = np.percentile(_k_lows, 8)   # 最低8%分位
+                _k_support_zone_high = np.percentile(_k_lows, 18)  # 最低18%分位
+
+                # 近期觸及支撐帶（近10根有碰到）
+                _k_recent_lows = [float(df["Low"].iloc[i]) if "Low" in df.columns
+                                  else float(_k_close.iloc[i]) for i in range(-10, 0)]
+                _k_touched_support = any(_k_support_zone_low * 0.995 <= l <= _k_support_zone_high * 1.01
+                                         for l in _k_recent_lows)
+                # 當前價格在支撐帶上方反彈（至少1%）
+                _k_rebounded = _k_price > _k_support_zone_high * 1.01
+
+                if _k_touched_support and _k_rebounded:
+                    _k_touch_count = sum(1 for l in _k_recent_lows
+                                         if _k_support_zone_low * 0.995 <= l <= _k_support_zone_high * 1.02)
+                    ck = f"{symbol}|{period_label}|支撐帶反彈|{df.index[-1].strftime('%Y%m%d') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:10]}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        add_alert(symbol, period_label,
+                                  f"📈 【支撐帶反彈】{_k_touch_count}次測試支撐帶"
+                                  f"（{_k_support_zone_low:.2f}-{_k_support_zone_high:.2f}）後反彈"
+                                  f"，當前={_k_price:.2f}"
+                                  f"，支撐有效！可考慮逢低做多。", "bull")
+                        new_signals.append(f"支撐帶反彈×{_k_touch_count}")
+
+    except Exception:
+        pass
     if not new_signals or not trigger_ai:
         return
     if not get_groq_key():
