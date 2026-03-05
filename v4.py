@@ -3696,6 +3696,84 @@ def run_alerts(symbol, period_label, df, trigger_ai=False, mkt=None):
 
     except Exception:
         pass
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # L. VIX 轉折 × 股價位置 共振訊號（圖：VIX高位轉跌＋股價低位→強力買入）
+    # ══════════════════════════════════════════════════════════════════════════
+    try:
+        _vix = fetch_vix_intraday()
+        if not _vix.get("error") and _vix.get("spot"):
+            _vix_spot   = float(_vix["spot"])
+            _vix_pct    = float(_vix.get("chg_pct_from_prev", 0))
+            _vix_trend  = _vix.get("trend_5bar", "flat")
+            _vix_signal = int(_vix.get("signal", 0))   # -4~+4
+
+            _lp = float(close.iloc[-1])
+            _lp_low20  = float(close.iloc[-20:].min()) if len(close) >= 20 else _lp
+            _lp_high20 = float(close.iloc[-20:].max()) if len(close) >= 20 else _lp
+            _lp_range  = _lp_high20 - _lp_low20
+            # 股價在近20根的相對位置（0=最低，100=最高）
+            _lp_pos = (_lp - _lp_low20) / _lp_range * 100 if _lp_range > 0 else 50
+
+            _ts = df.index[-1].strftime('%Y%m%d%H') if hasattr(df.index[-1], 'strftime') else str(df.index[-1])[:13]
+
+            # ── L1. VIX 高位急跌 + 股價在低位（最強買入共振）─────────────────
+            # 圖中 20:00 場景：VIX 從高位開始下降，TSLA 從低點反彈
+            if (_vix_signal >= 2          # VIX 下跌（利多股市）
+                    and _vix_pct < -1.5   # VIX 較前日跌超1.5%
+                    and _lp_pos < 35      # 股價在近期低位
+                    and _vix_spot > 18):  # VIX 仍在相對高位（下跌空間大）
+                ck = f"{symbol}|{period_label}|VIX高位急跌低位共振|{_ts}"
+                if ck not in st.session_state.sent_alerts:
+                    st.session_state.sent_alerts.add(ck)
+                    add_alert(symbol, period_label,
+                              f"🚀 【VIX×股價共振買入】VIX={_vix_spot:.1f} 高位急跌 {_vix_pct:+.1f}%"
+                              f"（{_vix.get('trend_label','')}）"
+                              f"，股價在近期低位（位置{_lp_pos:.0f}%）"
+                              f"，恐慌消退＋股價超跌，強力買入共振！", "bull")
+                    new_signals.append(f"VIX高跌{_vix_pct:.1f}%×股價低位{_lp_pos:.0f}%")
+
+            # ── L2. VIX 低位 + 股價創新高（趨勢延伸確認）────────────────────
+            elif (_vix_signal >= 1 and _vix_spot < 16 and _lp_pos > 80):
+                ck = f"{symbol}|{period_label}|VIX低位股價強勢|{_ts}"
+                if ck not in st.session_state.sent_alerts:
+                    st.session_state.sent_alerts.add(ck)
+                    add_alert(symbol, period_label,
+                              f"📈 【低恐慌+強勢確認】VIX={_vix_spot:.1f} 低位平穩"
+                              f"，股價在近期高位（{_lp_pos:.0f}%）"
+                              f"，市場情緒穩定，趨勢延伸有效！", "bull")
+                    new_signals.append(f"VIX低{_vix_spot:.0f}×股價強{_lp_pos:.0f}%")
+
+            # ── L3. VIX 急升 + 股價在高位（頂部反轉預警）───────────────────
+            elif (_vix_signal <= -2       # VIX 上升（利空股市）
+                    and _vix_pct > 2.0    # VIX 較前日升超2%
+                    and _lp_pos > 70      # 股價在近期高位
+                    and _vix_spot > 18):  # VIX 有明顯水平
+                ck = f"{symbol}|{period_label}|VIX急升高位共振|{_ts}"
+                if ck not in st.session_state.sent_alerts:
+                    st.session_state.sent_alerts.add(ck)
+                    add_alert(symbol, period_label,
+                              f"⚠️ 【VIX×股價共振賣出】VIX={_vix_spot:.1f} 急升 {_vix_pct:+.1f}%"
+                              f"（{_vix.get('trend_label','')}）"
+                              f"，股價在近期高位（位置{_lp_pos:.0f}%）"
+                              f"，恐慌升溫＋股價高位，注意下行風險！", "bear")
+                    new_signals.append(f"VIX急升{_vix_pct:.1f}%×股價高位{_lp_pos:.0f}%")
+
+            # ── L4. VIX 暴升（恐慌級別）+ 任意倉位（極端風險警報）────────────
+            if _vix_signal <= -4 or (_vix_pct > 10 and _vix_spot > 25):
+                ck = f"{symbol}|{period_label}|VIX極端恐慌|{_ts}"
+                if ck not in st.session_state.sent_alerts:
+                    st.session_state.sent_alerts.add(ck)
+                    add_alert(symbol, period_label,
+                              f"🚨 【極端恐慌警報】VIX={_vix_spot:.1f} 暴升 {_vix_pct:+.1f}%"
+                              f"，市場進入恐慌模式，所有多單注意風控！", "bear")
+                    new_signals.append(f"VIX極端恐慌{_vix_spot:.0f}")
+
+    except Exception:
+        pass
+
+    # ── 有新信號 → 自動觸發 AI 分析 ──────────────────────────────────────────
+    if not new_signals or not trigger_ai:
         return
     if not get_groq_key():
         return
